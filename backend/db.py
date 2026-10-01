@@ -11,9 +11,27 @@ DSN = os.environ.get(
 )
 
 SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS slot_reservations (
+    id serial PRIMARY KEY,
+    slot_no text NOT NULL,
+    starts_at timestamptz NOT NULL,
+    ends_at timestamptz NOT NULL,
+    lit boolean NOT NULL DEFAULT true,
+    created_by text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    extinguished_at timestamptz,
+    extinguished_by text,
+    CONSTRAINT chk_slot_window CHECK (ends_at > starts_at)
+);
+-- 同一舱号至多只能有一条亮舱：重复预约必须先熄后约
+CREATE UNIQUE INDEX IF NOT EXISTS uq_slot_lit
+    ON slot_reservations (slot_no) WHERE lit;
+
 CREATE TABLE IF NOT EXISTS probe_readings (
     id serial PRIMARY KEY,
     probe_id text NOT NULL,
+    slot_no text,
+    reservation_id integer REFERENCES slot_reservations (id),
     temp_c double precision NOT NULL,
     verdict text,
     reason text,
@@ -23,6 +41,15 @@ CREATE TABLE IF NOT EXISTS probe_readings (
     processed_at timestamptz
 );
 CREATE INDEX IF NOT EXISTS idx_probe_readings_status ON probe_readings (status, id);
+-- 一笔预约至多挂一笔单：挂单后该舱即非“空选”，撞车由数据库兜底拒收。
+-- reservation_id 为 NULL 的旧种子单据不受唯一约束影响（PG 中 NULL 互不相等）。
+CREATE UNIQUE INDEX IF NOT EXISTS uq_reading_reservation
+    ON probe_readings (reservation_id);
+
+-- 兼容既有库：补列
+ALTER TABLE probe_readings ADD COLUMN IF NOT EXISTS slot_no text;
+ALTER TABLE probe_readings
+    ADD COLUMN IF NOT EXISTS reservation_id integer REFERENCES slot_reservations (id);
 """
 
 
@@ -35,7 +62,7 @@ def ensure_schema_sync(conn) -> None:
 
 
 async def create_pool() -> asyncpg.Pool:
-    return await asyncpg.create_pool(DSN, min_size=1, max_size=5)
+    return await asyncpg.create_pool(DSN, min_size=2, max_size=8)
 
 
 async def ensure_schema_async(pool: asyncpg.Pool) -> None:
